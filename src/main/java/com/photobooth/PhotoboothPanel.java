@@ -1,6 +1,7 @@
 package com.photobooth;
 
 import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.IconTextField;
 
@@ -17,7 +18,9 @@ public class PhotoboothPanel extends PluginPanel
     private static final Pattern NAME_PATTERN = Pattern.compile("^[A-Za-z0-9 _-]{1,12}$");
 
     private final IconTextField searchBar = new IconTextField();
+
     private final JLabel statusLabel = new JLabel();
+    private final JPanel equipmentPanel = new JPanel();
 
     private Consumer<String> lookupHandler;
 
@@ -35,6 +38,7 @@ public class PhotoboothPanel extends PluginPanel
         searchBar.addActionListener(e -> search()); // fires on Enter
         searchBar.addClearListener(this::reset);
 
+        // Will probably remove this later
         statusLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
         statusLabel.setBorder(BorderFactory.createEmptyBorder(8, 2, 0, 2));
 
@@ -44,6 +48,11 @@ public class PhotoboothPanel extends PluginPanel
         top.add(searchBar);
         top.add(statusLabel);
 
+        equipmentPanel.setLayout(new BoxLayout(equipmentPanel, BoxLayout.Y_AXIS));
+        equipmentPanel.setOpaque(false);
+        equipmentPanel.setBorder(BorderFactory.createEmptyBorder(8, 2, 0, 2));
+        top.add(equipmentPanel);
+
         add(top, BorderLayout.NORTH);
         showStatus("Enter a player name and press Enter.", false);
     }
@@ -51,6 +60,38 @@ public class PhotoboothPanel extends PluginPanel
     void setLookupHandler(Consumer<String> handler)
     {
         this.lookupHandler = handler;
+    }
+
+    // Temporary
+    private static String slotLabel(EquipmentEntry entry)
+    {
+        String name = entry.getSlot().name().toLowerCase();
+        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
+    }
+
+    // Will likely make this into the 3d renderer
+    void showEquipment(PlayerSnapshot snapshot)
+    {
+        SwingUtilities.invokeLater(() ->
+        {
+            searchBar.setEditable(true);
+            searchBar.setIcon(IconTextField.Icon.SEARCH);
+            showStatus("Showing " + snapshot.getPlayerName() + " (" + snapshot.getEquipment().size() + " items)", false);
+
+            equipmentPanel.removeAll();
+            for (EquipmentEntry entry : snapshot.getEquipment())
+            {
+                // Plain-text labels (no <html>) because item names come from the game cache.
+                JLabel row = new JLabel(slotLabel(entry) + ": " + entry.getItemName());
+                row.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+                row.setFont(FontManager.getRunescapeSmallFont());
+                row.setAlignmentX(Component.LEFT_ALIGNMENT);
+                equipmentPanel.add(row);
+            }
+
+            revalidate();
+            repaint();
+        });
     }
 
 
@@ -83,7 +124,8 @@ public class PhotoboothPanel extends PluginPanel
         showStatus("Enter a player name and press Enter.", false);
     }
 
-    /** Safe to call from any thread. Re-enables the search bar. */
+    // This just shows the message below the search bar.
+    // In the future, I want the error message to be in the search bar itself
     void showResult(String message, boolean error)
     {
         SwingUtilities.invokeLater(() ->

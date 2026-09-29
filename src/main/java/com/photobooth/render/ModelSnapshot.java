@@ -1,4 +1,4 @@
-package com.photobooth.modelviewer;
+package com.photobooth.render;
 
 import java.util.Arrays;
 import javax.annotation.Nullable;

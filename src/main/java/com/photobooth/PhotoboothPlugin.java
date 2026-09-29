@@ -1,34 +1,36 @@
 package com.photobooth;
 
-import com.google.inject.Provides;
+import com.photobooth.render.ModelSnapshot;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.List;
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Player;
 import net.runelite.api.PlayerComposition;
-import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.kit.KitType;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 
-import java.awt.*;
-import java.awt.image.BufferedImage;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-
 @Slf4j
 @PluginDescriptor(
-	name = "Photobooth"
+		name = "Photobooth",
+		description = "Preview nearby players and their equipment in a 3D photobooth",
+		tags = {"player", "model", "equipment", "outfit", "cosmetic", "screenshot"}
 )
 public class PhotoboothPlugin extends Plugin
 {
+	private static final int NAV_PRIORITY = 7;
+
 	@Inject
 	private Client client;
 
@@ -39,114 +41,112 @@ public class PhotoboothPlugin extends Plugin
 	private ClientToolbar clientToolbar;
 
 	@Inject
-	private PhotoboothConfig config;
-
-	@Inject
-	private PhotoboothPanel panel;
-
-    @Inject
 	private ItemManager itemManager;
+
+	private PhotoboothPanel panel;
+	private NavigationButton navButton;
 
 	@Override
 	protected void startUp()
 	{
-		panel.setLookupHandler(this::lookup);
+		// Created here (not injected) so each enable gets a fresh panel with its callback fixed at construction
+		panel = new PhotoboothPanel(itemManager, this::lookup);
 
-        NavigationButton navButton = NavigationButton.builder()
-                .tooltip("Photobooth")
-                .priority(7)
-                .icon(createPlaceholderIcon())
-                .panel(panel)
-                .build();
+		navButton = NavigationButton.builder()
+				.tooltip("Photobooth")
+				.priority(NAV_PRIORITY)
+				.icon(createPlaceholderIcon())
+				.panel(panel)
+				.build();
 
 		clientToolbar.addNavigation(navButton);
 	}
 
 	@Override
-	protected void shutDown() throws Exception
+	protected void shutDown()
 	{
-		log.debug("Photobooth stopped!");
+		clientToolbar.removeNavigation(navButton);
+		navButton = null;
+		panel = null;
 	}
 
+	/** Called on the Swing EDT by the panel. Hops to the client thread to read game state. */
 	private void lookup(String name)
 	{
+		// Capture now: if the plugin shuts down mid-lookup, we update a detached panel instead of throwing an NPE
+		PhotoboothPanel view = panel;
+
 		clientThread.invoke(() ->
 		{
-			Player found = null;
-
-			// Hit Photobooth API
-			// Dummy API Call for now
-			boolean playerFound = false;
-			if(playerFound)
+			if (client.getGameState() != GameState.LOGGED_IN)
 			{
-				// TODO: API call done here
-			}
-			else
-			{
-				// Search for players in the logged in world
-				for (Player player : client.getPlayers())
-				{
-					if (player == null ||
-							player.getName() == null)
-					{
-						continue;
-					}
-					// In-game names can contain non-breaking spaces
-					String playerName = player.getName().replace('\u00A0', ' ');
-					if (playerName.equalsIgnoreCase(name))
-					{
-						found = player;
-						break;
-					}
-				}
-			}
-
-			if (found == null)
-			{
-				panel.showResult(name + " isn't loaded nearby. Players must be in your scene in order to retrieve equipment information", true);
+				view.showError("You need to be logged in to look up players.");
 				return;
 			}
 
-			PlayerSnapshot snapshot = readEquipment(found);
-			panel.showEquipment(snapshot);
+			Player player = findPlayer(name);
+			if (player == null)
+			{
+				view.showError(name + " isn't loaded nearby. Players must be in your scene to be photographed.");
+				return;
+			}
 
-			panel.showResult("Found " + found.getName(), false);
+			ModelSnapshot model = ModelSnapshot.from(player.getModel());
+			if (model == null)
+			{
+				view.showError("Couldn't read " + name + "'s model. Try again in a moment.");
+				return;
+			}
+
+			PlayerSnapshot snapshot = new PlayerSnapshot(
+					PlayerNames.normalize(player.getName()),
+					readEquipment(player),
+					model);
+
+			log.debug("Snapshot of {}: {} vertices, {} faces, {} equipment slots",
+					snapshot.getPlayerName(), model.getVertexCount(), model.getFaceCount(), snapshot.getEquipment().size());
+
+			view.showPlayer(snapshot);
 		});
 	}
 
-	private PlayerSnapshot readEquipment(Player player)
+	/** Client thread only. {@code name} must already be normalized. */
+	@Nullable
+	private Player findPlayer(String name)
+	{
+		for (Player player : client.getTopLevelWorldView().players())
+		{
+			String playerName = player == null ? null : player.getName();
+			if (playerName != null && PlayerNames.normalize(playerName).equalsIgnoreCase(name))
+			{
+				return player;
+			}
+		}
+		return null;
+	}
+
+	/** Client thread only (ItemManager.getItemComposition reads the game cache). */
+	private List<EquipmentEntry> readEquipment(Player player)
 	{
 		PlayerComposition composition = player.getPlayerComposition();
 		if (composition == null)
 		{
-			return null;
+			return List.of();
 		}
 
-		List<EquipmentEntry> entries = new ArrayList<EquipmentEntry>();
+		List<EquipmentEntry> entries = new ArrayList<>();
 		for (KitType slot : KitType.values())
 		{
 			int itemId = composition.getEquipmentId(slot);
-			if (itemId == -1)
+			if (itemId != -1) // -1 = nothing equipped in this slot
 			{
-				continue; // nothing equipped in this slot
+				entries.add(new EquipmentEntry(slot, itemId, itemManager.getItemComposition(itemId).getName()));
 			}
-
-			String itemName = itemManager.getItemComposition(itemId).getName();
-			entries.add(new EquipmentEntry(slot, itemId, itemName));
 		}
-
-		return new PlayerSnapshot(
-				player.getName().replace('\u00A0', ' '),
-				Collections.unmodifiableList(entries));
+		return List.copyOf(entries);
 	}
 
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged gameStateChanged)
-	{
-
-	}
-
-	/** Simple generated icon so you don't need a resource file yet. Swap for a 16x16 PNG later. */
+	/** Generated so no resource file is needed yet. Swap for a 16x16 PNG via ImageUtil.loadImageResource later. */
 	private static BufferedImage createPlaceholderIcon()
 	{
 		BufferedImage img = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
@@ -158,11 +158,5 @@ public class PhotoboothPlugin extends Plugin
 		g.fillOval(5, 6, 6, 6);
 		g.dispose();
 		return img;
-	}
-
-	@Provides
-	PhotoboothConfig provideConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(PhotoboothConfig.class);
 	}
 }

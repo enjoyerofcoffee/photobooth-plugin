@@ -1,4 +1,4 @@
-package com.photobooth.modelviewer;
+package com.photobooth.render;
 
 /** Converts OSRS face colours to 24-bit RGB. */
 final class JagexColours

@@ -1,4 +1,4 @@
-package com.photobooth.modelviewer;
+package com.photobooth.render;
 
 import java.awt.Cursor;
 import java.awt.Dimension;

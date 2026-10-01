@@ -1,159 +1,248 @@
 package com.photobooth.render;
 
+import com.photobooth.contract.Appearance;
+import com.photobooth.model.AppearanceModelBuilder;
+import com.photobooth.model.MeshSnapshot;
+import com.photobooth.model.ModelBuildResult;
+import java.awt.Color;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.Point;
+import java.awt.RenderingHints;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
 import java.awt.image.BufferedImage;
-import javax.annotation.Nullable;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.swing.JComponent;
 import javax.swing.JPanel;
+import javax.swing.SwingUtilities;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.ui.ColorScheme;
-import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.FontManager;
 
-/** Mouse-orbitable view of a {@link ModelSnapshot}. EDT only. */
-public class ModelViewer extends JPanel
+/**
+ * The 3D view. Receives only an {@link Appearance}; builds the mesh on the client thread,
+ * then renders and handles interaction on the Swing EDT.
+ * <p>
+ * Drag to rotate, scroll to zoom, double-click to reset the camera.
+ * Renders only when something changes (model, size, camera), never per game frame.
+ */
+@Slf4j
+public class ModelViewer extends JPanel implements AppearanceView
 {
-    private static final int VIEW_HEIGHT = 320;
-    private static final String EMPTY_HINT = "Search a player to see them here";
+	private static final double DEFAULT_YAW = Math.toRadians(-30);
+	private static final double DEFAULT_PITCH = Math.toRadians(8);
+	private static final double MIN_PITCH = Math.toRadians(-60);
+	private static final double MAX_PITCH = Math.toRadians(60);
+	private static final Color BACKGROUND = ColorScheme.DARKER_GRAY_COLOR;
 
-    private static final double ROTATE_SPEED = 0.01; // radians per pixel dragged
-    private static final double MAX_PITCH = 1.4;
-    private static final double MIN_ZOOM = 0.3;
-    private static final double MAX_ZOOM = 5.0;
-    private static final double ZOOM_STEP = 1.1;
+	private final AppearanceModelBuilder builder;
+	private final ClientThread clientThread;
+	private final AtomicInteger buildId = new AtomicInteger();
 
-    private final ModelRenderer renderer = new ModelRenderer();
+	// EDT-only state
+	private MeshSnapshot mesh;
+	private String message = "Search for a player to see them here.";
+	private double yaw = DEFAULT_YAW;
+	private double pitch = DEFAULT_PITCH;
+	private double zoom = 1.0;
+	private BufferedImage frame;
+	private boolean dirty = true;
+	private Point dragStart;
 
-    private ModelSnapshot model;
-    private double yaw;
-    private double pitch;
-    private double zoom = 1.0;
+	public ModelViewer(AppearanceModelBuilder builder, ClientThread clientThread)
+	{
+		this.builder = builder;
+		this.clientThread = clientThread;
 
-    private BufferedImage frame;
-    private boolean dirty = true;
+		setBackground(BACKGROUND);
+		setPreferredSize(new Dimension(0, 380));
+		setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
 
-    public ModelViewer()
-    {
-        setOpaque(true);
-        setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        setPreferredSize(new Dimension(PluginPanel.PANEL_WIDTH - 20, VIEW_HEIGHT));
-        setMaximumSize(new Dimension(Integer.MAX_VALUE, VIEW_HEIGHT));
-        setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+		MouseAdapter mouse = new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent e)
+			{
+				dragStart = e.getPoint();
+			}
 
-        OrbitControls controls = new OrbitControls();
-        addMouseListener(controls);
-        addMouseMotionListener(controls);
-        addMouseWheelListener(controls); // also stops the sidebar scrolling while over the viewer
-    }
+			@Override
+			public void mouseDragged(MouseEvent e)
+			{
+				if (dragStart == null || mesh == null)
+				{
+					return;
+				}
+				yaw += (e.getX() - dragStart.x) * 0.012;
+				pitch = clamp(pitch + (e.getY() - dragStart.y) * 0.008, MIN_PITCH, MAX_PITCH);
+				dragStart = e.getPoint();
+				invalidateFrame();
+			}
 
-    /** Pass null to clear. */
-    public void setModel(@Nullable ModelSnapshot model)
-    {
-        this.model = model;
-        resetView();
-    }
+			@Override
+			public void mouseReleased(MouseEvent e)
+			{
+				dragStart = null;
+			}
 
-    private void resetView()
-    {
-        yaw = 0;
-        pitch = 0;
-        zoom = 1.0;
-        invalidateFrame();
-    }
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				if (e.getClickCount() == 2)
+				{
+					resetCamera();
+				}
+			}
+		};
+		addMouseListener(mouse);
+		addMouseMotionListener(mouse);
+	}
 
-    private void invalidateFrame()
-    {
-        dirty = true;
-        repaint();
-    }
+	// ---- AppearanceView (EDT) ----
 
-    @Override
-    protected void paintComponent(Graphics g)
-    {
-        super.paintComponent(g);
+	@Override
+	public JComponent getComponent()
+	{
+		return this;
+	}
 
-        int width = getWidth();
-        int height = getHeight();
-        if (width <= 0 || height <= 0)
-        {
-            return;
-        }
+	@Override
+	public void show(Appearance appearance)
+	{
+		int id = buildId.incrementAndGet();
+		mesh = null;
+		message = "Building model...";
+		invalidateFrame();
 
-        if (model == null)
-        {
-            g.setColor(ColorScheme.LIGHT_GRAY_COLOR);
-            FontMetrics fm = g.getFontMetrics();
-            g.drawString(EMPTY_HINT, (width - fm.stringWidth(EMPTY_HINT)) / 2, height / 2);
-            return;
-        }
+		// Model building reads/writes game state: client thread only.
+		clientThread.invoke(() ->
+		{
+			ModelBuildResult result = builder.build(appearance);
+			SwingUtilities.invokeLater(() -> onBuilt(id, result));
+		});
+	}
 
-        if (frame == null || frame.getWidth() != width || frame.getHeight() != height)
-        {
-            frame = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-            dirty = true;
-        }
+	@Override
+	public void clear()
+	{
+		buildId.incrementAndGet();
+		mesh = null;
+		message = "";
+		invalidateFrame();
+	}
 
-        // Only re-render when the view changed; plain repaints just blit the cached frame
-        if (dirty)
-        {
-            renderer.render(model, yaw, pitch, zoom, frame);
-            dirty = false;
-        }
+	/** Current view as an image of the given size; used by screenshots later. */
+	public BufferedImage renderImage(int width, int height, int backgroundArgb)
+	{
+		return SoftwareRasterizer.render(mesh, width, height,
+			new SoftwareRasterizer.Camera(yaw, pitch, zoom), backgroundArgb);
+	}
 
-        g.drawImage(frame, 0, 0, null);
-    }
+	public boolean hasModel()
+	{
+		return mesh != null;
+	}
 
-    private static double clamp(double value, double min, double max)
-    {
-        return Math.max(min, Math.min(max, value));
-    }
+	// ---- internals (EDT) ----
 
-    private final class OrbitControls extends MouseAdapter
-    {
-        private Point lastDrag;
+	private void onBuilt(int id, ModelBuildResult result)
+	{
+		if (id != buildId.get())
+		{
+			return; // superseded by a newer search
+		}
+		if (result.isSuccess())
+		{
+			mesh = result.getMesh();
+			message = null;
+			log.debug("Photobooth model built: {} vertices, {} faces", mesh.getVertexCount(), mesh.getFaceCount());
+		}
+		else
+		{
+			message = result.getError();
+		}
+		resetCamera();
+	}
 
-        @Override
-        public void mousePressed(MouseEvent e)
-        {
-            lastDrag = e.getPoint();
-        }
+	private void resetCamera()
+	{
+		yaw = DEFAULT_YAW;
+		pitch = DEFAULT_PITCH;
+		zoom = 1.0;
+		invalidateFrame();
+	}
 
-        @Override
-        public void mouseDragged(MouseEvent e)
-        {
-            if (lastDrag != null)
-            {
-                yaw += (e.getX() - lastDrag.x) * ROTATE_SPEED;
-                pitch = clamp(pitch + (e.getY() - lastDrag.y) * ROTATE_SPEED, -MAX_PITCH, MAX_PITCH);
-                invalidateFrame();
-            }
-            lastDrag = e.getPoint();
-        }
+	private void invalidateFrame()
+	{
+		dirty = true;
+		repaint();
+	}
 
-        @Override
-        public void mouseReleased(MouseEvent e)
-        {
-            lastDrag = null;
-        }
+	@Override
+	protected void paintComponent(Graphics g)
+	{
+		super.paintComponent(g);
+		int w = getWidth();
+		int h = getHeight();
+		if (w <= 0 || h <= 0)
+		{
+			return;
+		}
 
-        @Override
-        public void mouseClicked(MouseEvent e)
-        {
-            if (e.getClickCount() == 2)
-            {
-                resetView();
-            }
-        }
+		if (mesh != null)
+		{
+			if (dirty || frame == null || frame.getWidth() != w || frame.getHeight() != h)
+			{
+				long start = System.nanoTime();
+				frame = renderImage(w, h, BACKGROUND.getRGB());
+				dirty = false;
+				log.trace("Photobooth frame {}x{} in {} ms", w, h, (System.nanoTime() - start) / 1_000_000);
+			}
+			g.drawImage(frame, 0, 0, null);
+		}
 
-        @Override
-        public void mouseWheelMoved(MouseWheelEvent e)
-        {
-            zoom = clamp(zoom * Math.pow(ZOOM_STEP, -e.getPreciseWheelRotation()), MIN_ZOOM, MAX_ZOOM);
-            invalidateFrame();
-        }
-    }
+		if (message != null && !message.isEmpty())
+		{
+			drawMessage((Graphics2D) g, w, h);
+		}
+	}
+
+	private void drawMessage(Graphics2D g, int w, int h)
+	{
+		g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+		g.setFont(FontManager.getRunescapeSmallFont());
+		g.setColor(ColorScheme.LIGHT_GRAY_COLOR);
+		FontMetrics fm = g.getFontMetrics();
+
+		// Simple word wrap so long errors fit the 225px sidebar.
+		int maxWidth = w - 20;
+		StringBuilder line = new StringBuilder();
+		int y = h / 2 - fm.getHeight();
+		for (String word : message.split(" "))
+		{
+			String candidate = line.length() == 0 ? word : line + " " + word;
+			if (fm.stringWidth(candidate) > maxWidth && line.length() > 0)
+			{
+				g.drawString(line.toString(), (w - fm.stringWidth(line.toString())) / 2, y);
+				y += fm.getHeight();
+				line = new StringBuilder(word);
+			}
+			else
+			{
+				line = new StringBuilder(candidate);
+			}
+		}
+		g.drawString(line.toString(), (w - fm.stringWidth(line.toString())) / 2, y);
+	}
+
+	private static double clamp(double v, double min, double max)
+	{
+		return Math.max(min, Math.min(max, v));
+	}
 }
